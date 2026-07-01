@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>大鱼吃小鱼</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene"></canvas>
+
+    <div id="hud" class="hidden">
+      <div class="hud-size">
+        <span class="label">体长</span>
+        <span id="hud-size-value">1.0</span>
+        <span class="unit">m</span>
+      </div>
+      <div class="hud-score">
+        <span class="label">已吞食</span>
+        <span id="hud-score-value">0</span>
+      </div>
+      <div class="hud-dash">
+        <span class="label">冲刺</span>
+        <div class="hud-dash-bar"><div id="hud-dash-fill" class="hud-dash-fill"></div></div>
+        <span id="hud-dash-key">空格/右键</span>
+      </div>
+      <div id="hud-warning" class="hud-warning hidden">危险！附近有更大的鱼！</div>
+    </div>
+
+    <div id="crosshair" class="hidden"></div>
+
+    <div id="screen-start" class="screen">
+      <div class="panel">
+        <h1>大鱼吃小鱼</h1>
+        <p class="subtitle">在真实感的海洋里成长为顶级掠食者</p>
+        <ul class="rules">
+          <li>鼠标移动控制转向，鱼会自然地摆尾游动</li>
+          <li>按住 <b>Shift</b> 或点击左键 持续冲刺加速</li>
+          <li>按 <b>空格</b> 或点击右键 瞬间冲刺扑向猎物（有冷却）</li>
+          <li>吃掉比自己小的鱼可以成长，遇到更大的鱼要及时躲避</li>
+          <li>长到足够大，成为整片海域的王者</li>
+        </ul>
+        <button id="btn-start">开始游戏</button>
+      </div>
+    </div>
+
+    <div id="screen-gameover" class="screen hidden">
+      <div class="panel">
+        <h1 id="gameover-title">你被吃掉了</h1>
+        <p id="gameover-detail" class="subtitle">最终体长 0.0m ・ 吞食 0 条鱼</p>
+        <button id="btn-restart">再来一次</button>
+      </div>
+    </div>
+
+    <div id="loading" class="screen">
+      <div class="panel">
+        <h1>加载中...</h1>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
