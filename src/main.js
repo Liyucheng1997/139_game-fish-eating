@@ -1,12 +1,12 @@
-import { UI } from "./game/UI.js";
 import { Game } from "./game/Game.js";
+import { UI } from "./game/UI.js";
 
 const canvas = document.getElementById("scene");
 const ui = new UI();
 const game = new Game(canvas, ui);
 
-ui.onStart(() => game.start());
-ui.onRestart(() => game.start());
-
-ui.hideLoading();
-ui.showStart();
+ui.bind({
+  onStart: () => game.start(),
+  onRestart: () => game.start(),
+  onContinue: () => game.continueEndless(),
+});

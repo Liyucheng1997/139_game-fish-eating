@@ -1,238 +1,751 @@
-import * as THREE from "three";
-import { World } from "./World.js";
+import { clamp, damp, randRange, randPick, TAU } from "./utils.js";
+import { Background } from "./Background.js";
 import { Input } from "./Input.js";
-import { FishEntity, EAT_RATIO } from "./entities/FishEntity.js";
-import { WakeTrail } from "./effects/WakeTrail.js";
-import { IndicatorManager } from "./effects/IndicatorManager.js";
-import { clamp, randRange, randomInSphere } from "./utils.js";
+import { Particles } from "./Particles.js";
+import { Sfx } from "./Sfx.js";
+import { PlayerFish, AIFish, PufferFish, Jellyfish, Shark, PowerUp, EAT_RATIO } from "./Entities.js";
 
-const BOUNDARY_RADIUS = 32;
-const AI_COUNT = 36;
-const WIN_SIZE = 10;
+const WORLD_W = 5200;
+const WORLD_H = 3000;
+const AI_COUNT = 32;
+const PUFFER_COUNT = 2;
+const JELLY_COUNT = 3;
+const COMBO_WINDOW = 2.8;
+const FRENZY_COMBO = 6;
 
-function randomSpawnSize(playerSize) {
+// Growth levels: reach the last one to become king of the ocean.
+export const LEVELS = [
+  { len: 60, name: "小鱼苗" },
+  { len: 95, name: "机灵小鱼" },
+  { len: 150, name: "浅海猎手" },
+  { len: 230, name: "大块头" },
+  { len: 340, name: "深海霸主" },
+  { len: 480, name: "海洋之王" },
+];
+
+function randomSpawnLen(playerLen) {
   const roll = Math.random();
-  let size;
-  if (roll < 0.68) size = playerSize * randRange(0.3, 0.7);
-  else if (roll < 0.9) size = playerSize * randRange(0.75, 1.05);
-  else size = playerSize * randRange(1.6, 2.6);
-  return clamp(size, 0.22, 34);
+  let len;
+  if (roll < 0.62) len = playerLen * randRange(0.3, 0.7);
+  else if (roll < 0.86) len = playerLen * randRange(0.75, 1.05);
+  else len = playerLen * randRange(1.35, 2.3);
+  return clamp(len, 18, 620);
 }
 
 export class Game {
   constructor(canvas, ui) {
     this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
     this.ui = ui;
+    this.input = new Input(canvas);
+    this.sfx = new Sfx();
+    this.background = new Background(WORLD_W, WORLD_H);
+    this.particles = new Particles();
+
     this.running = false;
-    this.clock = new THREE.Clock();
+    this.time = 0;
+    this._last = performance.now();
 
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.cam = { x: WORLD_W / 2, y: WORLD_H / 2, zoom: 1 };
+    this.shake = 0;
+    this.hurtFlash = 0;
 
-    this.scene = new THREE.Scene();
-    this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
-    this._cameraPos = new THREE.Vector3(0, 4, -12);
-    this._cameraLookOffset = new THREE.Vector3();
-
-    this.world = new World(this.scene, { boundaryRadius: BOUNDARY_RADIUS });
-    this.input = new Input();
-    this.wake = new WakeTrail(this.scene, 70);
-    this.indicators = new IndicatorManager(this.scene);
-
-    this.entities = [];
-    this.player = null;
-    this.score = 0;
-
-    this._resizeObserver = new ResizeObserver((entries) => {
-      const { width, height } = entries[0].contentRect;
-      if (width < 1 || height < 1) return;
-      this.camera.aspect = width / height;
-      this.camera.updateProjectionMatrix();
-      this.renderer.setSize(width, height, false);
-    });
-    this._resizeObserver.observe(this.canvas);
+    this._resize();
+    window.addEventListener("resize", () => this._resize());
 
     this._loop = this._loop.bind(this);
     requestAnimationFrame(this._loop);
   }
 
+  _resize() {
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+    this.W = window.innerWidth;
+    this.H = window.innerHeight;
+    this.canvas.width = Math.round(this.W * this.dpr);
+    this.canvas.height = Math.round(this.H * this.dpr);
+  }
+
+  // ------------------------------------------------------------------ setup
   start() {
-    for (const e of this.entities) {
-      this.scene.remove(e.object3D);
-      e.dispose();
-    }
-    this.entities = [];
-    this.indicators.clear();
+    this.sfx.init();
+    this.particles.clear();
+
+    this.player = new PlayerFish(WORLD_W / 2, WORLD_H / 2, 60);
+    this.player.invincible = 2;
+    this.fishes = [];
+    this.puffers = [];
+    this.jellies = [];
+    this.powerups = [];
+    this.shark = null;
+
     this.score = 0;
+    this.eaten = 0;
+    this.lives = 3;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.frenzy = false;
+    this.level = 0;
+    this.won = false;
+    this.endless = false;
 
-    this.player = new FishEntity({
-      isPlayer: true,
-      size: 1,
-      position: new THREE.Vector3(0, 0, 0),
-      heading: new THREE.Vector3(0, 0, 1),
-      hue: 42,
-    });
-    this.scene.add(this.player.object3D);
-    this.entities.push(this.player);
+    this.goldTimer = randRange(14, 22);
+    this.powerupTimer = randRange(10, 16);
+    this.sharkTimer = randRange(40, 60);
 
-    for (let i = 0; i < AI_COUNT; i++) {
-      this._spawnAI(randomSpawnSize(this.player.size));
+    for (let i = 0; i < AI_COUNT; i++) this._spawnFish(true);
+    for (let i = 0; i < PUFFER_COUNT; i++) this._spawnPuffer();
+    for (let i = 0; i < JELLY_COUNT; i++) {
+      this.jellies.push(new Jellyfish(randRange(300, WORLD_W - 300), randRange(400, WORLD_H - 500), randRange(70, 130)));
     }
+
+    this.cam.x = this.player.x;
+    this.cam.y = this.player.y;
+    this.cam.zoom = this._targetZoom();
 
     this.running = true;
     this.ui.showPlaying();
+    this.ui.setLives(this.lives);
+    this.ui.setLevel(this.level, LEVELS, this.player.len);
   }
 
-  _spawnAI(size) {
-    let pos;
-    // Spawn near the player's current neighborhood rather than anywhere in the whole
-    // world, so there's always a nearby shoal to hunt instead of an empty search.
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const p = randomInSphere(randRange(8, BOUNDARY_RADIUS * 0.6));
-      const vec = this.player ? this.player.position.clone().add(new THREE.Vector3(p.x, p.y * 0.4, p.z)) : new THREE.Vector3(p.x, p.y * 0.5, p.z);
-      if (vec.length() > BOUNDARY_RADIUS * 0.95) vec.multiplyScalar((BOUNDARY_RADIUS * 0.95) / vec.length());
-      if (!this.player || vec.distanceTo(this.player.position) > 10) {
-        pos = vec;
-        break;
+  _viewRadius() {
+    return Math.hypot(this.W, this.H) / (2 * this.cam.zoom);
+  }
+
+  // Spawn just outside the viewport so fish "arrive" instead of popping in.
+  _spawnPos(anywhere = false) {
+    for (let i = 0; i < 10; i++) {
+      let x, y;
+      if (anywhere) {
+        x = randRange(200, WORLD_W - 200);
+        y = randRange(220, WORLD_H - 220);
+      } else {
+        const a = randRange(0, TAU);
+        const r = this._viewRadius() + randRange(120, 500);
+        x = this.player.x + Math.cos(a) * r;
+        y = this.player.y + Math.sin(a) * r * 0.7;
       }
+      if (x < 150 || x > WORLD_W - 150 || y < 200 || y > WORLD_H - 200) continue;
+      if (!anywhere || Math.hypot(x - this.player.x, y - this.player.y) > 500) return { x, y };
     }
-    if (!pos) pos = new THREE.Vector3(randRange(-BOUNDARY_RADIUS, BOUNDARY_RADIUS), 0, randRange(-BOUNDARY_RADIUS, BOUNDARY_RADIUS));
-
-    const entity = new FishEntity({
-      isPlayer: false,
-      size,
-      position: pos,
-      aggression: randRange(0.15, 0.85),
-    });
-    this.scene.add(entity.object3D);
-    this.entities.push(entity);
-    return entity;
+    return { x: randRange(300, WORLD_W - 300), y: randRange(300, WORLD_H - 300) };
   }
 
-  _removeAI(entity) {
-    this.scene.remove(entity.object3D);
-    entity.dispose();
-    this.indicators.remove(entity);
-    const idx = this.entities.indexOf(entity);
-    if (idx >= 0) this.entities.splice(idx, 1);
+  _spawnFish(anywhere = false) {
+    const pos = this._spawnPos(anywhere);
+    this.fishes.push(new AIFish(pos.x, pos.y, randomSpawnLen(this.player.len)));
   }
 
-  _endGame(won) {
-    this.running = false;
-    this.ui.showGameOver({ won, size: this.player.size, score: this.score });
+  _spawnPuffer() {
+    const pos = this._spawnPos(true);
+    this.puffers.push(new PufferFish(pos.x, pos.y, clamp(this.player.len * randRange(0.6, 0.9), 40, 320)));
   }
 
-  _loop() {
+  _spawnGold() {
+    const pos = this._spawnPos(false);
+    this.fishes.push(new AIFish(pos.x, pos.y, clamp(this.player.len * 0.45, 20, 200), { gold: true, ttl: 12 }));
+    this.ui.toast("✨ 黄金鱼出现了！");
+  }
+
+  _spawnPowerup() {
+    const pos = this._spawnPos(false);
+    this.powerups.push(new PowerUp(pos.x, pos.y, randPick(["star", "magnet", "bolt"])));
+  }
+
+  _spawnShark() {
+    const fromLeft = this.player.x > WORLD_W / 2;
+    const len = Math.max(this.player.len * 1.7, 300);
+    const shark = new Shark(fromLeft ? -250 : WORLD_W + 250, clamp(this.player.y + randRange(-300, 300), 300, WORLD_H - 300), len);
+    shark.angle = fromLeft ? 0 : Math.PI;
+    this.shark = shark;
+    this.ui.warn("🦈 鲨鱼出没！小心！", 3.2);
+    this.sfx.warning();
+    this.shake = Math.max(this.shake, 8);
+  }
+
+  // ------------------------------------------------------------------ loop
+  _loop(now) {
     requestAnimationFrame(this._loop);
-    const dt = Math.min(this.clock.getDelta(), 0.05);
+    const dt = Math.min((now - this._last) / 1000, 0.05);
+    this._last = now;
+    this.time += dt;
+
+    if (this.input.takeMuteToggle()) {
+      const muted = this.sfx.toggleMute();
+      this.ui.toast(muted ? "🔇 已静音" : "🔊 声音开启");
+    }
+
     if (this.running) this._update(dt);
-    this.world.update(dt);
-    this.wake.update(dt);
-    this.renderer.render(this.scene, this.camera);
+    this.background.update(dt);
+    this.particles.update(dt);
+    this._updateCamera(dt);
+    this._draw();
+  }
+
+  _screenToWorld(sx, sy) {
+    return {
+      x: (sx - this.W / 2) / this.cam.zoom + this.cam.x,
+      y: (sy - this.H / 2) / this.cam.zoom + this.cam.y,
+    };
   }
 
   _update(dt) {
-    const steer = this.input.steer;
-    this.player.updatePlayer(dt, steer);
-    this._containInBounds(this.player);
-    this._emitWake(steer);
+    const p = this.player;
 
-    const aiList = this.entities.filter((e) => !e.isPlayer);
-    for (const ai of aiList) {
-      ai.updateAI(dt, { player: this.player, boundaryRadius: BOUNDARY_RADIUS, neighbors: aiList });
-      this._containInBounds(ai);
+    // --- player steering toward the pointer ---
+    const target = this.input.hasPointer
+      ? this._screenToWorld(this.input.pointerX, this.input.pointerY)
+      : { x: p.x + Math.cos(p.angle) * 100, y: p.y + Math.sin(p.angle) * 100 };
+    const wasDashReady = p.dashCooldown <= 0;
+    p.update(dt, target, this.input.boost, this.input.takeDash(), this.sfx);
+    if (wasDashReady && p.dashTimer > 0.3) {
+      this.shake = Math.max(this.shake, 3);
+      this.particles.bubbles(p.x - Math.cos(p.angle) * p.len * 0.5, p.y - Math.sin(p.angle) * p.len * 0.5, 8, 90, 5);
+    }
+    p.contain(WORLD_W, WORLD_H);
+    if ((this.input.boost && p.speed > 60) || p.dashTimer > 0) {
+      if (Math.random() < 0.5) {
+        this.particles.bubbles(p.x - Math.cos(p.angle) * p.len * 0.5, p.y - Math.sin(p.angle) * p.len * 0.5, 1, 60, 3.5);
+      }
     }
 
-    this._resolveEating(aiList, dt);
-    this._updateCamera(dt);
-    this._updateHud(aiList);
-    this.indicators.update(aiList, this.player, this.camera);
-
-    if (this.player.size >= WIN_SIZE) {
-      this._endGame(true);
-    }
-  }
-
-  _emitWake(steer) {
-    const player = this.player;
-    const dashing = player.dashTimer > 0;
-    if (!steer.boost && !dashing) return;
-
-    const tailPos = player.position.clone().addScaledVector(player.forward, -player.radius * 1.15);
-    const backVelocity = player.forward.clone().multiplyScalar(-1.4);
-    const puffs = dashing ? 4 : 2;
-    for (let i = 0; i < puffs; i++) {
-      this.wake.emit(tailPos, backVelocity, Math.max(0.5, player.displaySize * 0.4));
-    }
-  }
-
-  _containInBounds(entity) {
-    const p = entity.position;
-    const dist = p.length();
-    if (dist > BOUNDARY_RADIUS * 1.02) {
-      p.multiplyScalar((BOUNDARY_RADIUS * 1.02) / dist);
-    }
-    const floorY = this.world.floorY + entity.radius * 0.4;
-    if (p.y < floorY) p.y = floorY;
-  }
-
-  _resolveEating(aiList, dt) {
-    const player = this.player;
-    for (const ai of [...aiList]) {
-      const dist = ai.position.distanceTo(player.position);
-      const threshold = player.radius * 0.85 + ai.radius * 0.55;
-      if (dist > threshold) continue;
-
-      if (player.size > ai.size * EAT_RATIO) {
-        player.grow(ai.size * 0.24);
-        this.score += 1;
-        this._removeAI(ai);
-        this._spawnAI(randomSpawnSize(player.size));
-      } else if (ai.size > player.size * EAT_RATIO) {
-        this._endGame(false);
-        return;
-      } else {
-        const away = new THREE.Vector3().subVectors(player.position, ai.position);
-        if (away.lengthSq() > 0.0001) {
-          away.normalize();
-          player.position.addScaledVector(away, 1.5 * dt);
+    // --- combo decay ---
+    if (this.comboTimer > 0) {
+      this.comboTimer -= dt;
+      if (this.comboTimer <= 0) {
+        this.combo = 0;
+        if (this.frenzy) {
+          this.frenzy = false;
+          this.ui.setFrenzy(false);
         }
       }
     }
+
+    // --- AI updates ---
+    const ctx = { player: p, neighbors: this.fishes, worldW: WORLD_W, worldH: WORLD_H };
+    for (const f of this.fishes) f.update(dt, ctx);
+    for (const f of this.puffers) f.update(dt, ctx);
+    for (const j of this.jellies) j.update(dt, ctx);
+    for (const pu of this.powerups) pu.update(dt);
+    if (this.shark) {
+      this.shark.update(dt, ctx);
+      if (!this.shark.alive) this.shark = null;
+    }
+
+    // golden fish sparkle trail + expiry
+    for (let i = this.fishes.length - 1; i >= 0; i--) {
+      const f = this.fishes[i];
+      if (f.isGold) {
+        if (Math.random() < 0.35) this.particles.sparkle(f.x, f.y, 1, f.len * 0.3);
+        if (f.ttl <= 0) {
+          this.fishes.splice(i, 1);
+          this._spawnFish();
+        }
+      }
+    }
+    this.powerups = this.powerups.filter((pu) => pu.alive);
+
+    this._resolveEating(dt);
+    this._resolveHazards(dt);
+    this._resolvePowerups();
+    this._updateSpawnTimers(dt);
+    this._updateHud();
+  }
+
+  // ------------------------------------------------------------ interactions
+  _eatFish(f, index) {
+    const p = this.player;
+    this.fishes.splice(index, 1);
+    this.eaten++;
+
+    this.combo++;
+    this.comboTimer = COMBO_WINDOW;
+    const mult = Math.min(this.combo, 10);
+    if (!this.frenzy && this.combo >= FRENZY_COMBO) {
+      this.frenzy = true;
+      this.ui.setFrenzy(true);
+      this.sfx.frenzy();
+      this.particles.ring(p.x, p.y, p.len, "rgba(255,180,60,0.9)");
+    }
+
+    let growth = f.len * 0.08;
+    let points = Math.ceil(f.len / 6) * mult;
+    if (this.frenzy) {
+      growth *= 1.4;
+      points *= 2;
+    }
+    if (p.boltPower > 0) points *= 2;
+    if (f.isGold) {
+      growth *= 5;
+      points *= 5;
+      this.sfx.bigEat();
+      this.particles.sparkle(f.x, f.y, 18, f.len * 0.5);
+      this.ui.toast("✨ 吃到黄金鱼！");
+    } else {
+      this.sfx.eat(this.combo);
+    }
+
+    p.grow(growth);
+    this.score += points;
+    p.flash = 0.5;
+
+    const color = f.isGold ? "#ffd700" : "#aef2ff";
+    this.particles.burst(f.x, f.y, f.isGold ? "rgba(255,215,60,0.9)" : "rgba(170,230,255,0.85)", 12, 150, f.len * 0.08 + 3);
+    this.particles.bubbles(f.x, f.y, 5, 70, 4);
+    this.particles.text(f.x, f.y - f.len * 0.4, mult > 1 ? `+${points} x${mult}` : `+${points}`, { color, size: clamp(16 + mult * 2, 18, 34) });
+
+    this._spawnFish();
+    this._checkLevelUp();
+  }
+
+  _checkLevelUp() {
+    const p = this.player;
+    let newLevel = this.level;
+    while (newLevel + 1 < LEVELS.length && p.len >= LEVELS[newLevel + 1].len) newLevel++;
+    if (newLevel === this.level) {
+      this.ui.setLevel(this.level, LEVELS, p.len);
+      return;
+    }
+    this.level = newLevel;
+    this.sfx.levelUp();
+    this.particles.ring(p.x, p.y, p.len * 1.2, "rgba(140,255,200,0.9)");
+    this.particles.text(p.x, p.y - p.len * 0.6, `进化：${LEVELS[this.level].name}！`, { color: "#9dffcf", size: 30 });
+    if (this.lives < 3) {
+      this.lives++;
+      this.ui.setLives(this.lives);
+      this.ui.toast("❤️ 生命 +1");
+    }
+    this.ui.setLevel(this.level, LEVELS, p.len);
+
+    if (this.level === LEVELS.length - 1 && !this.won) {
+      this.won = true;
+      this.running = false;
+      this.sfx.win();
+      this.ui.showWin({ score: this.score, eaten: this.eaten, len: p.len });
+    }
+  }
+
+  _resolveEating(dt) {
+    const p = this.player;
+    if (p.stunned > 0) {
+      p.mouthOpen = damp(p.mouthOpen, 0, 8, dt);
+      return;
+    }
+
+    // open mouth when an edible fish is near the snout
+    let nearestEdible = Infinity;
+
+    // regular + gold fish
+    for (let i = this.fishes.length - 1; i >= 0; i--) {
+      const f = this.fishes[i];
+      const canEat = p.len > f.len * EAT_RATIO;
+      const d = Math.hypot(f.x - p.mouthX, f.y - p.mouthY);
+      if (canEat) {
+        nearestEdible = Math.min(nearestEdible, d - f.r);
+        if (d < f.r + p.len * 0.1) this._eatFish(f, i);
+      }
+    }
+
+    // puffer fish
+    for (let i = this.puffers.length - 1; i >= 0; i--) {
+      const f = this.puffers[i];
+      const d = Math.hypot(f.x - p.mouthX, f.y - p.mouthY);
+      const touching = d < f.r + p.len * 0.12;
+      if (!touching) continue;
+      if (f.inflated && p.starPower <= 0) {
+        // spiky! bounce off and lose your rhythm
+        const a = Math.atan2(p.y - f.y, p.x - f.x);
+        p.x += Math.cos(a) * 60;
+        p.y += Math.sin(a) * 60;
+        p.stunned = Math.max(p.stunned, 0.7);
+        p.shrink(0.97);
+        this.combo = 0;
+        this.comboTimer = 0;
+        if (this.frenzy) {
+          this.frenzy = false;
+          this.ui.setFrenzy(false);
+        }
+        this.sfx.sting();
+        this.shake = Math.max(this.shake, 7);
+        this.hurtFlash = Math.max(this.hurtFlash, 0.4);
+        this.particles.ring(f.x, f.y, f.r, "rgba(255,170,60,0.9)");
+        this.particles.text(p.x, p.y - p.len * 0.5, "被刺到了！", { color: "#ffb45e", size: 22 });
+      } else if (p.len > f.len * EAT_RATIO) {
+        this.puffers.splice(i, 1);
+        const points = Math.ceil(f.len / 3) * Math.min(this.combo + 1, 10);
+        this.score += points;
+        this.eaten++;
+        p.grow(f.len * 0.12);
+        this.sfx.bigEat();
+        this.particles.burst(f.x, f.y, "rgba(245,215,140,0.9)", 18, 180, 6);
+        this.particles.text(f.x, f.y - f.r, `河豚大餐 +${points}`, { color: "#ffe9a8", size: 26 });
+        this._spawnPuffer();
+        this._checkLevelUp();
+      }
+    }
+
+    // shark: at max sizes the tables turn
+    if (this.shark) {
+      const s = this.shark;
+      const d = Math.hypot(s.x - p.mouthX, s.y - p.mouthY);
+      if (p.len > s.len * EAT_RATIO && d < s.r + p.len * 0.12) {
+        this.shark = null;
+        const points = 2000;
+        this.score += points;
+        this.eaten++;
+        p.grow(s.len * 0.1);
+        this.sfx.bigEat();
+        this.shake = 10;
+        this.particles.burst(s.x, s.y, "rgba(180,200,220,0.95)", 30, 260, 9);
+        this.particles.text(s.x, s.y - s.r, `吞掉鲨鱼！+${points}`, { color: "#ff8a8a", size: 36 });
+        this.ui.toast("🏆 你吃掉了鲨鱼！");
+        this._checkLevelUp();
+      }
+    }
+
+    const openTarget = nearestEdible < p.len * 1.1 ? 1 : 0;
+    p.mouthOpen = damp(p.mouthOpen, openTarget, 8, dt);
+  }
+
+  _resolveHazards(dt) {
+    const p = this.player;
+
+    // jellyfish sting
+    for (const j of this.jellies) {
+      const d = Math.hypot(j.x - p.x, j.y - p.y);
+      if (d < j.r + p.r * 0.7 && p.invincible <= 0 && p.starPower <= 0) {
+        const a = Math.atan2(p.y - j.y, p.x - j.x);
+        p.x += Math.cos(a) * 90;
+        p.y += Math.sin(a) * 90;
+        p.stunned = Math.max(p.stunned, 1.1);
+        p.invincible = Math.max(p.invincible, 1.6);
+        p.shrink(0.96);
+        this.combo = 0;
+        this.comboTimer = 0;
+        if (this.frenzy) {
+          this.frenzy = false;
+          this.ui.setFrenzy(false);
+        }
+        this.sfx.sting();
+        this.shake = Math.max(this.shake, 8);
+        this.hurtFlash = Math.max(this.hurtFlash, 0.5);
+        this.particles.burst(p.x, p.y, "rgba(220,140,255,0.9)", 14, 160, 5);
+        this.particles.text(p.x, p.y - p.len * 0.5, "⚡ 被水母蜇了！", { color: "#e8a8ff", size: 24 });
+      }
+    }
+
+    // getting eaten by bigger fish / the shark
+    if (p.invincible > 0 || p.starPower > 0) return;
+    const threats = this.shark ? [...this.fishes, this.shark] : this.fishes;
+    for (const t of threats) {
+      if (t.len <= p.len * EAT_RATIO) continue;
+      const d = Math.hypot(p.x - t.mouthX, p.y - t.mouthY);
+      if (d < p.r + t.len * 0.1) {
+        this._playerHit(t);
+        return;
+      }
+    }
+  }
+
+  _playerHit(threat) {
+    const p = this.player;
+    this.lives--;
+    this.ui.setLives(this.lives);
+    this.combo = 0;
+    this.comboTimer = 0;
+    if (this.frenzy) {
+      this.frenzy = false;
+      this.ui.setFrenzy(false);
+    }
+    this.shake = 14;
+    this.hurtFlash = 1;
+    this.sfx.hurt();
+    this.particles.burst(p.x, p.y, "rgba(255,120,110,0.9)", 22, 220, 7);
+
+    if (this.lives <= 0) {
+      this.running = false;
+      this.sfx.lose();
+      this.ui.showGameOver({ score: this.score, eaten: this.eaten, len: p.len, levelName: LEVELS[this.level].name });
+      return;
+    }
+
+    // escape the jaws: knockback, brief invincibility, slight shrink
+    const a = Math.atan2(p.y - threat.y, p.x - threat.x);
+    p.x += Math.cos(a) * (threat.len * 0.8 + 120);
+    p.y += Math.sin(a) * (threat.len * 0.5 + 80);
+    p.contain(WORLD_W, WORLD_H);
+    p.invincible = 2.6;
+    p.stunned = 0.4;
+    p.shrink(0.9);
+    this._checkLevelUpDown();
+    this.particles.text(p.x, p.y - p.len, "危险！快逃！", { color: "#ff9d9d", size: 26 });
+    this.ui.warn(`💔 被咬了！剩余生命 ${this.lives}`, 2.2);
+  }
+
+  _checkLevelUpDown() {
+    // shrinking can drop you a level
+    let lv = 0;
+    while (lv + 1 < LEVELS.length && this.player.len >= LEVELS[lv + 1].len) lv++;
+    if (lv !== this.level) {
+      this.level = lv;
+      this.ui.setLevel(this.level, LEVELS, this.player.len);
+    }
+  }
+
+  _resolvePowerups() {
+    const p = this.player;
+    for (const pu of this.powerups) {
+      const d = Math.hypot(pu.x - p.x, pu.y - p.y);
+      if (d > pu.r + p.r) continue;
+      pu.alive = false;
+      this.sfx.powerup();
+      this.particles.ring(pu.x, pu.y, pu.r, "rgba(160,235,255,0.95)");
+      this.particles.burst(pu.x, pu.y, "rgba(200,245,255,0.9)", 12, 140, 4);
+      if (pu.type === "star") {
+        p.starPower = 8;
+        this.ui.toast("⭐ 无敌！大鱼也怕你！");
+      } else if (pu.type === "magnet") {
+        p.magnetPower = 8;
+        this.ui.toast("🧲 磁力！小鱼自动上门！");
+      } else {
+        p.boltPower = 8;
+        this.ui.toast("⚡ 狂暴！极速 + 双倍分数！");
+      }
+    }
+    this.powerups = this.powerups.filter((pu) => pu.alive);
+  }
+
+  _updateSpawnTimers(dt) {
+    this.goldTimer -= dt;
+    if (this.goldTimer <= 0) {
+      this.goldTimer = randRange(18, 30);
+      this._spawnGold();
+    }
+    this.powerupTimer -= dt;
+    if (this.powerupTimer <= 0) {
+      this.powerupTimer = randRange(15, 24);
+      this._spawnPowerup();
+    }
+    if (!this.shark && this.level >= 2) {
+      this.sharkTimer -= dt;
+      if (this.sharkTimer <= 0) {
+        this.sharkTimer = randRange(35, 55);
+        this._spawnShark();
+      }
+    }
+  }
+
+  _updateHud() {
+    const p = this.player;
+    let danger = false;
+    const threats = this.shark ? [...this.fishes, this.shark] : this.fishes;
+    for (const t of threats) {
+      if (t.len > p.len * EAT_RATIO && Math.hypot(t.x - p.x, t.y - p.y) < 460 + t.len) {
+        danger = true;
+        break;
+      }
+    }
+    this.ui.updateHud({
+      score: this.score,
+      combo: this.combo,
+      comboT: this.comboTimer / COMBO_WINDOW,
+      danger: danger && p.starPower <= 0,
+      dash: p.dashReadiness,
+      len: p.len,
+      powers: { star: p.starPower, magnet: p.magnetPower, bolt: p.boltPower },
+    });
+    this.ui.setLevel(this.level, LEVELS, p.len);
+  }
+
+  // ------------------------------------------------------------------ camera
+  _targetZoom() {
+    const minZoom = Math.max(this.W / WORLD_W, this.H / WORLD_H, 0.4);
+    return clamp(90 / this.player.len, minZoom, 1.15);
   }
 
   _updateCamera(dt) {
-    const player = this.player;
-    const dist = 7 + player.size * 1.7;
-    const height = 2.4 + player.size * 0.7;
-    const desired = player.position
-      .clone()
-      .addScaledVector(player.forward, -dist)
-      .addScaledVector(new THREE.Vector3(0, 1, 0), height);
+    if (!this.player) return;
+    const p = this.player;
+    this.cam.zoom = damp(this.cam.zoom, this._targetZoom(), 1.6, dt);
 
-    this._cameraPos.lerp(desired, 1 - Math.pow(0.001, dt));
-    this.camera.position.copy(this._cameraPos);
+    // lead slightly ahead of the swim direction
+    const lead = Math.min(120, p.speed * 0.35);
+    const tx = p.x + Math.cos(p.angle) * lead;
+    const ty = p.y + Math.sin(p.angle) * lead;
+    this.cam.x = damp(this.cam.x, tx, 3.2, dt);
+    this.cam.y = damp(this.cam.y, ty, 3.2, dt);
 
-    const lookTarget = player.position.clone().addScaledVector(player.forward, 4);
-    this.camera.lookAt(lookTarget);
+    const hw = this.W / (2 * this.cam.zoom);
+    const hh = this.H / (2 * this.cam.zoom);
+    this.cam.x = clamp(this.cam.x, Math.min(hw, WORLD_W / 2), Math.max(WORLD_W - hw, WORLD_W / 2));
+    this.cam.y = clamp(this.cam.y, Math.min(hh, WORLD_H / 2), Math.max(WORLD_H - hh, WORLD_H / 2));
+
+    this.shake = Math.max(0, this.shake - dt * 26);
+    this.hurtFlash = Math.max(0, this.hurtFlash - dt * 1.8);
   }
 
-  _updateHud(aiList) {
-    let danger = false;
-    for (const ai of aiList) {
-      if (ai.size > this.player.size * EAT_RATIO) {
-        const dist = ai.position.distanceTo(this.player.position);
-        if (dist < 14 + ai.size * 1.3) {
-          danger = true;
-          break;
-        }
+  _applyCamera(ctx, parallax = 1) {
+    const { zoom } = this.cam;
+    const shakeX = this.shake > 0 ? randRange(-this.shake, this.shake) : 0;
+    const shakeY = this.shake > 0 ? randRange(-this.shake, this.shake) : 0;
+    // anchor far layers so they stay inside the world while moving slower
+    const cx = this.cam.x * parallax + (WORLD_W / 2) * (1 - parallax);
+    const cy = this.cam.y * parallax + WORLD_H * (1 - parallax) * 0.9;
+    ctx.setTransform(
+      this.dpr * zoom, 0, 0, this.dpr * zoom,
+      this.dpr * (this.W / 2 - cx * zoom + shakeX),
+      this.dpr * (this.H / 2 - cy * zoom + shakeY)
+    );
+  }
+
+  // ------------------------------------------------------------------ draw
+  _draw() {
+    const ctx = this.ctx;
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+    // 1. water + rays + snow (screen space)
+    this.background.drawWater(ctx, this.W, this.H, this.cam);
+    this.background.drawRays(ctx, this.W, this.H, this.cam, this.time);
+
+    // 2. far parallax silhouettes
+    this._applyCamera(ctx, 0.45);
+    this.background.drawFar(ctx, this.time);
+
+    // 3. world layer
+    this._applyCamera(ctx, 1);
+    const view = {
+      left: this.cam.x - this.W / (2 * this.cam.zoom) - 60,
+      right: this.cam.x + this.W / (2 * this.cam.zoom) + 60,
+      top: this.cam.y - this.H / (2 * this.cam.zoom) - 60,
+      bottom: this.cam.y + this.H / (2 * this.cam.zoom) + 60,
+    };
+    this.background.drawWorld(ctx, this.time, view);
+
+    if (this.player) {
+      for (const pu of this.powerups) pu.draw(ctx);
+
+      // small fish first so bigger ones overlap them
+      const sorted = [...this.fishes].sort((a, b) => a.len - b.len);
+      for (const f of sorted) {
+        if (f.x + f.len < view.left || f.x - f.len > view.right || f.y + f.len < view.top || f.y - f.len > view.bottom) continue;
+        f.draw(ctx);
       }
+      for (const f of this.puffers) f.draw(ctx);
+      if (this.shark) this.shark.draw(ctx);
+
+      // magnet field hint
+      if (this.player.magnetPower > 0) {
+        ctx.save();
+        ctx.strokeStyle = `rgba(255,120,120,${0.25 + Math.sin(this.time * 6) * 0.1})`;
+        ctx.setLineDash([14, 12]);
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(this.player.x, this.player.y, 560, 0, TAU);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      this.player.draw(ctx, this.time);
+      for (const j of this.jellies) j.draw(ctx);
+      this.particles.draw(ctx);
+      this.particles.drawTexts(ctx, this.cam.zoom);
     }
-    this.ui.updateHud({ size: this.player.size, score: this.score, danger, dashReadiness: this.player.dashReadiness });
+
+    // 4. screen-space overlays
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this._drawVignette(ctx);
+    if (this.frenzy) {
+      const a = 0.12 + Math.sin(this.time * 7) * 0.05;
+      const g = ctx.createRadialGradient(this.W / 2, this.H / 2, this.H * 0.32, this.W / 2, this.H / 2, this.H * 0.75);
+      g.addColorStop(0, "rgba(255,150,40,0)");
+      g.addColorStop(1, `rgba(255,140,30,${a})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, this.W, this.H);
+    }
+    if (this.hurtFlash > 0) {
+      ctx.fillStyle = `rgba(255,40,40,${this.hurtFlash * 0.28})`;
+      ctx.fillRect(0, 0, this.W, this.H);
+    }
+    if (this.player && this.running) this._drawMinimap(ctx);
   }
+
+  _drawVignette(ctx) {
+    const g = ctx.createRadialGradient(this.W / 2, this.H / 2, Math.min(this.W, this.H) * 0.45, this.W / 2, this.H / 2, Math.max(this.W, this.H) * 0.75);
+    g.addColorStop(0, "rgba(0,10,25,0)");
+    g.addColorStop(1, "rgba(0,8,22,0.5)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, this.W, this.H);
+  }
+
+  _drawMinimap(ctx) {
+    const mw = 168;
+    const mh = mw * (WORLD_H / WORLD_W);
+    const mx = this.W - mw - 18;
+    const my = this.H - mh - 18;
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.fillStyle = "rgba(4,26,44,0.62)";
+    ctx.strokeStyle = "rgba(140,220,255,0.35)";
+    ctx.lineWidth = 1.5;
+    roundRect(ctx, mx, my, mw, mh, 8);
+    ctx.fill();
+    ctx.stroke();
+
+    const px = (x) => mx + (x / WORLD_W) * mw;
+    const py = (y) => my + (y / WORLD_H) * mh;
+
+    for (const f of this.fishes) {
+      if (f.isGold) {
+        ctx.fillStyle = "#ffd700";
+      } else if (f.len > this.player.len * EAT_RATIO) {
+        ctx.fillStyle = "rgba(255,105,95,0.95)";
+      } else {
+        ctx.fillStyle = "rgba(150,210,235,0.55)";
+      }
+      ctx.fillRect(px(f.x) - 1.5, py(f.y) - 1.5, 3, 3);
+    }
+    ctx.fillStyle = "#c792ff";
+    for (const j of this.jellies) ctx.fillRect(px(j.x) - 1.5, py(j.y) - 1.5, 3, 3);
+    ctx.fillStyle = "#7df9ff";
+    for (const pu of this.powerups) {
+      ctx.beginPath();
+      ctx.arc(px(pu.x), py(pu.y), 3, 0, TAU);
+      ctx.fill();
+    }
+    if (this.shark) {
+      ctx.fillStyle = "#ff5d5d";
+      ctx.beginPath();
+      ctx.arc(px(this.shark.x), py(this.shark.y), 4.5, 0, TAU);
+      ctx.fill();
+    }
+    // player blip
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "rgba(255,255,255,0.6)";
+    ctx.beginPath();
+    ctx.arc(px(this.player.x), py(this.player.y), 3.5, 0, TAU);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(px(this.player.x), py(this.player.y), 6 + Math.sin(this.time * 4) * 2, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Continue after winning: endless mode with more sharks.
+  continueEndless() {
+    this.endless = true;
+    this.running = true;
+    this.sharkTimer = randRange(12, 20);
+    this.ui.showPlaying();
+    this.ui.toast("🌊 无尽畅游模式 — 海洋任你遨游！");
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
 }
