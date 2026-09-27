@@ -6,7 +6,7 @@ export class Input {
     this.pointerX = window.innerWidth / 2;
     this.pointerY = window.innerHeight / 2;
     this.hasPointer = false;
-    this.boost = false; // hold: Shift or left mouse button
+    this._boostSources = new Set(); // independent mouse / touch / Shift holds
     this._dashQueued = false; // tap: Space or right mouse button
     this._muteQueued = false;
 
@@ -16,11 +16,11 @@ export class Input {
       this.hasPointer = true;
     });
     canvas.addEventListener("mousedown", (e) => {
-      if (e.button === 0) this.boost = true;
+      if (e.button === 0) this._boostSources.add("mouse");
       if (e.button === 2) this._dashQueued = true;
     });
     window.addEventListener("mouseup", (e) => {
-      if (e.button === 0) this.boost = false;
+      if (e.button === 0) this._boostSources.delete("mouse");
     });
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -34,7 +34,7 @@ export class Input {
         this.pointerX = t.clientX;
         this.pointerY = t.clientY;
         this.hasPointer = true;
-        this.boost = true;
+        this._boostSources.add("touch");
       },
       { passive: false }
     );
@@ -49,20 +49,36 @@ export class Input {
       { passive: false }
     );
     canvas.addEventListener("touchend", (e) => {
-      if (e.touches.length === 0) this.boost = false;
+      if (e.touches.length === 0) this._boostSources.delete("touch");
     });
+    canvas.addEventListener("touchcancel", () => this._boostSources.delete("touch"));
 
     window.addEventListener("keydown", (e) => {
-      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.boost = true;
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this._boostSources.add(e.code);
       if (e.code === "Space") {
         e.preventDefault();
-        this._dashQueued = true;
+        if (!e.repeat) this._dashQueued = true;
       }
-      if (e.code === "KeyM") this._muteQueued = true;
+      if (e.code === "KeyM" && !e.repeat) this._muteQueued = true;
     });
     window.addEventListener("keyup", (e) => {
-      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.boost = false;
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this._boostSources.delete(e.code);
     });
+    window.addEventListener("blur", () => this.reset());
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) this.reset();
+    });
+  }
+
+  get boost() {
+    return this._boostSources.size > 0;
+  }
+
+  reset() {
+    this._boostSources.clear();
+    this._dashQueued = false;
+    this._muteQueued = false;
+    this.hasPointer = false;
   }
 
   // Consume the dash tap (edge trigger).

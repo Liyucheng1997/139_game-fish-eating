@@ -10,3 +10,6 @@ ui.bind({
   onRestart: () => game.start(),
   onContinue: () => game.continueEndless(),
 });
+
+// handy for poking at the game from devtools during development
+if (import.meta.env.DEV) window.__game = game;

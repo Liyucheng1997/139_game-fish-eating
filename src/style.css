@@ -382,10 +382,26 @@ html, body {
 }
 
 @media (max-width: 600px) {
+  .screen { overflow-y: auto; padding: 12px 0; }
   .screen .panel {
     margin: 16px;
     padding: 26px 22px;
   }
   .screen h1 { font-size: 30px; }
   .hud-level-bar { width: 150px; }
+  .hud-top-left { top: 12px; left: 12px; }
+  .hud-top-right { top: 12px; right: 12px; }
+  .hud-top-center { top: 104px; width: calc(100% - 24px); }
+  #hud-score { font-size: 28px; }
+  .hud-lives { font-size: 18px; }
+  .hud-warning, .hud-frenzy { font-size: 12px; text-align: center; }
+  .btn-row { flex-wrap: wrap; }
+}
+
+@media (max-height: 540px) {
+  .screen { overflow-y: auto; align-items: flex-start; padding: 12px 0; }
+  .screen .panel { margin: auto 12px; padding: 18px 22px; }
+  .title-fish { font-size: 28px; }
+  .screen h1 { font-size: 28px; }
+  .screen .rules { margin-bottom: 14px; line-height: 1.7; }
 }

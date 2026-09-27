@@ -63,8 +63,51 @@ export class Particles {
     }
   }
 
-  ring(x, y, radius, color = "rgba(255,255,255,0.6)") {
-    this.rings.push({ x, y, r: radius * 0.4, target: radius * 2.2, color, life: 0.5, t: 0 });
+  ring(x, y, radius, color = "rgba(255,255,255,0.6)", life = 0.5, width = 3) {
+    this.rings.push({ x, y, r: radius * 0.4, target: radius * 2.2, color, life, t: 0, width });
+  }
+
+  // Water rushing into an opening mouth: streaks converge on (mx, my).
+  suction(mx, my, angle, reach, count = 14) {
+    for (let i = 0; i < count; i++) {
+      const a = angle + randRange(-0.9, 0.9);
+      const d = reach * randRange(0.45, 1);
+      const life = randRange(0.14, 0.24);
+      const x = mx + Math.cos(a) * d;
+      const y = my + Math.sin(a) * d;
+      this.parts.push({
+        kind: "streak",
+        x, y,
+        vx: (mx - x) / life,
+        vy: (my - y) / life,
+        len: randRange(0.25, 0.45) * reach,
+        w: Math.max(1, reach * 0.018),
+        life,
+        t: 0,
+      });
+    }
+  }
+
+  // Scale flakes glinting as they tumble out of a bite.
+  flakes(x, y, angle, count, colors, speed = 160, size = 4) {
+    for (let i = 0; i < count; i++) {
+      const a = angle + randRange(-1.4, 1.4);
+      const v = randRange(speed * 0.3, speed);
+      this.parts.push({
+        kind: "flake",
+        x, y,
+        vx: Math.cos(a) * v,
+        vy: Math.sin(a) * v - 20,
+        r: randRange(size * 0.5, size),
+        rot: randRange(0, TAU),
+        spin: randRange(-14, 14),
+        color: colors[(Math.random() * colors.length) | 0],
+        life: randRange(0.5, 1.1),
+        t: 0,
+        drag: 2.6,
+        sink: 30,
+      });
+    }
   }
 
   text(x, y, str, { color = "#ffffff", size = 22 } = {}) {
@@ -84,6 +127,8 @@ export class Particles {
         p.vy -= p.vy * p.drag * dt;
       }
       if (p.kind === "bubble") p.vy -= 30 * dt;
+      if (p.sink) p.vy += p.sink * dt;
+      if (p.spin) p.rot += p.spin * dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
     }
@@ -128,6 +173,31 @@ export class Particles {
         ctx.quadraticCurveTo(-s * 0.2, -s * 0.2, 0, -s);
         ctx.fill();
         ctx.restore();
+      } else if (p.kind === "streak") {
+        const sp = Math.hypot(p.vx, p.vy) || 1;
+        const tail = p.len * k;
+        ctx.strokeStyle = `rgba(215,245,255,${0.6 * Math.sin(Math.PI * (1 - k))})`;
+        ctx.lineWidth = p.w;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x - (p.vx / sp) * tail, p.y - (p.vy / sp) * tail);
+        ctx.stroke();
+      } else if (p.kind === "flake") {
+        const glint = Math.abs(Math.cos(p.rot));
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.rot * 0.5);
+        ctx.globalAlpha = k;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.ellipse(0, 0, p.r, p.r * (0.25 + 0.75 * glint), 0, 0, TAU);
+        ctx.fill();
+        if (glint > 0.85) {
+          ctx.fillStyle = `rgba(255,255,255,${(glint - 0.85) * 6 * k})`;
+          ctx.fill();
+        }
+        ctx.restore();
       } else {
         ctx.fillStyle = p.color;
         ctx.globalAlpha = k;
@@ -141,7 +211,7 @@ export class Particles {
       const k = r.t / r.life;
       ctx.strokeStyle = r.color;
       ctx.globalAlpha = (1 - k) * 0.8;
-      ctx.lineWidth = 3 * (1 - k) + 1;
+      ctx.lineWidth = (r.width || 3) * (1 - k) + 1;
       ctx.beginPath();
       ctx.arc(r.x, r.y, r.r + (r.target - r.r) * k, 0, TAU);
       ctx.stroke();

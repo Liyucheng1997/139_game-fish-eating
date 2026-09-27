@@ -1,7 +1,12 @@
-import { clamp, damp, randRange, turnToward, TAU } from "./utils.js";
+import { clamp, damp, randRange, turnToward, angleDiff, TAU } from "./utils.js";
 import { drawFish, drawPuffer, drawJellyfish, drawPowerUp, speciesForLen, PLAYER_SPEC, GOLD_SPEC, SHARK_SPEC } from "./FishArt.js";
 
 export const EAT_RATIO = 1.12; // predator must be this many times longer than prey
+
+const smoothFade = (k) => {
+  const t = clamp((k - 0.72) / 0.28, 0, 1);
+  return t * t * (3 - 2 * t);
+};
 
 let nextId = 1;
 
@@ -18,6 +23,13 @@ class BaseFish {
     this.phase = Math.random() * TAU;
     this.alive = true;
     this.mouthOpen = 0;
+    this.turn = 0; // smoothed angular velocity → body bend
+    this.swallowK = -1; // 0..1 while being sucked into a predator's mouth
+  }
+
+  get bend() {
+    const flip = Math.cos(this.angle) < 0 ? -1 : 1;
+    return clamp(this.turn * 0.22, -0.8, 0.8) * flip;
   }
 
   // Collision "body radius" — roughly half the body height.
@@ -37,7 +49,9 @@ class BaseFish {
   }
 
   _step(dt, targetAngle, targetSpeed, turnRate) {
+    const prev = this.angle;
     this.angle = turnToward(this.angle, targetAngle, turnRate * dt);
+    if (dt > 0) this.turn = damp(this.turn, angleDiff(prev, this.angle) / dt, 6, dt);
     this.speed = damp(this.speed, targetSpeed, 3.2, dt);
     this.x += Math.cos(this.angle) * this.speed * dt;
     this.y += Math.sin(this.angle) * this.speed * dt;
@@ -56,6 +70,13 @@ class BaseFish {
     ctx.save();
     ctx.translate(this.x, this.y);
     ctx.rotate(this.angle);
+    if (this.swallowK >= 0) {
+      // stretched toward the maw, shrinking and fading as it disappears
+      const k = this.swallowK;
+      const s = 1 - 0.55 * k * k;
+      ctx.scale(s * (1 + 0.45 * k), s * (1 - 0.3 * k));
+      ctx.globalAlpha *= 1 - smoothFade(k);
+    }
     if (Math.cos(this.angle) < 0) ctx.scale(1, -1); // keep the fish upright
     painter(ctx);
     ctx.restore();
@@ -75,6 +96,10 @@ export class PlayerFish extends BaseFish {
     this.starPower = 0;
     this.boltPower = 0;
     this.magnetPower = 0;
+    this.chomp = 0; // 1 → 0 snap-shut squash
+    this.gulpT = -1; // 0..1 bulge travelling down the belly
+    this.gulpSize = 0.5;
+    this.suck = 0; // >0 while something is being sucked in: jaws forced wide
   }
 
   get dashCooldownMax() {
@@ -101,6 +126,11 @@ export class PlayerFish extends BaseFish {
     this.starPower = Math.max(0, this.starPower - dt);
     this.boltPower = Math.max(0, this.boltPower - dt);
     this.magnetPower = Math.max(0, this.magnetPower - dt);
+    this.chomp = Math.max(0, this.chomp - dt * 4.5);
+    if (this.gulpT >= 0) {
+      this.gulpT += dt / (0.45 + this.gulpSize * 0.25);
+      if (this.gulpT > 1) this.gulpT = -1;
+    }
 
     if (dashPressed && this.dashCooldown <= 0 && this.stunned <= 0) {
       this.dashTimer = 0.32;
@@ -134,7 +164,7 @@ export class PlayerFish extends BaseFish {
     return this.dashCooldown <= 0 ? 1 : 1 - this.dashCooldown / this.dashCooldownMax;
   }
 
-  draw(ctx, time) {
+  draw(ctx, time, inMouth = null) {
     const blink = this.invincible > 0 && this.starPower <= 0 && Math.sin(time * 18) > 0;
     const glow = this.starPower > 0 ? "rgba(255,225,90,0.95)" : this.boltPower > 0 ? "rgba(110,240,255,0.9)" : null;
     this.drawTransformed(ctx, (c) => {
@@ -145,6 +175,11 @@ export class PlayerFish extends BaseFish {
         alpha: blink ? 0.35 : 1,
         glow,
         flash: this.flash,
+        bend: this.bend,
+        chomp: this.chomp,
+        gulp: this.gulpT,
+        gulpSize: this.gulpSize,
+        inMouth,
       });
     });
     if (this.starPower > 0) {
@@ -280,6 +315,7 @@ export class AIFish extends BaseFish {
         phase: this.phase,
         swim: clamp(this.speed / this.cruiseSpeed(), 0.3, 1.5),
         mouthOpen: this.mouthOpen,
+        bend: this.bend,
         glow: this.isGold ? GOLD_SPEC.glow : null,
         alpha: this.isGold && this.ttl < 3 ? 0.4 + Math.sin(this.ttl * 10) * 0.3 : 1,
       });
@@ -423,6 +459,7 @@ export class Shark extends BaseFish {
         phase: this.phase,
         swim: clamp(this.speed / this.cruiseSpeed(), 0.3, 1.3),
         mouthOpen: this.mouthOpen,
+        bend: this.bend,
       });
     });
   }

@@ -49,6 +49,20 @@ export class UI {
     this._show(this.screenOver, true);
   }
 
+  reset() {
+    clearTimeout(this._warnTimer);
+    clearTimeout(this._toastTimer);
+    this._warnLock = false;
+    this._lastCombo = -1;
+    this._lastScore = -1;
+    this._lastPowers = null;
+    this.comboEl.classList.remove("pop");
+    this.toastEl.classList.remove("show");
+    this._show(this.toastEl, false);
+    this._show(this.warnEl, false);
+    this.setFrenzy(false);
+  }
+
   showWin({ score, eaten, len }) {
     this.$("win-detail").textContent = `得分 ${score} ・ 吞食 ${eaten} 条 ・ 体长 ${(len / 100).toFixed(1)}m`;
     this._show(this.hud, false);
@@ -64,7 +78,7 @@ export class UI {
     const next = levels[level + 1];
     this.levelName.textContent = cur.name;
     if (next) {
-      const t = Math.min(1, (len - cur.len) / (next.len - cur.len));
+      const t = Math.max(0, Math.min(1, (len - cur.len) / (next.len - cur.len)));
       this.levelFill.style.width = `${(t * 100).toFixed(1)}%`;
     } else {
       this.levelFill.style.width = "100%";

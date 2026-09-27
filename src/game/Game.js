@@ -1,9 +1,10 @@
-import { clamp, damp, randRange, randPick, TAU } from "./utils.js";
+import { clamp, damp, lerp, randRange, randPick, turnToward, TAU } from "./utils.js";
 import { Background } from "./Background.js";
 import { Input } from "./Input.js";
 import { Particles } from "./Particles.js";
 import { Sfx } from "./Sfx.js";
 import { PlayerFish, AIFish, PufferFish, Jellyfish, Shark, PowerUp, EAT_RATIO } from "./Entities.js";
+import { setFishLighting } from "./FishArt.js";
 
 const WORLD_W = 5200;
 const WORLD_H = 3000;
@@ -49,6 +50,9 @@ export class Game {
     this.cam = { x: WORLD_W / 2, y: WORLD_H / 2, zoom: 1 };
     this.shake = 0;
     this.hurtFlash = 0;
+    this.hitstop = 0; // brief freeze-frame on big bites
+    this.zoomPunch = 0; // camera kick on each chomp
+    this.swallows = []; // prey currently being sucked into the player's mouth
 
     this._resize();
     window.addEventListener("resize", () => this._resize());
@@ -77,6 +81,13 @@ export class Game {
     this.jellies = [];
     this.powerups = [];
     this.shark = null;
+    this.swallows = [];
+    this.hitstop = 0;
+    this.zoomPunch = 0;
+
+    this.shake = 0;
+    this.hurtFlash = 0;
+    this.input.reset();
 
     this.score = 0;
     this.eaten = 0;
@@ -103,9 +114,15 @@ export class Game {
     this.cam.zoom = this._targetZoom();
 
     this.running = true;
+    this.ui.reset();
     this.ui.showPlaying();
     this.ui.setLives(this.lives);
     this.ui.setLevel(this.level, LEVELS, this.player.len);
+    this._updateHud();
+  }
+
+  get zoom() {
+    return this.cam.zoom * (1 + this.zoomPunch);
   }
 
   _viewRadius() {
@@ -175,17 +192,24 @@ export class Game {
       this.ui.toast(muted ? "🔇 已静音" : "🔊 声音开启");
     }
 
-    if (this.running) this._update(dt);
-    this.background.update(dt);
-    this.particles.update(dt);
+    // hit-stop: the world nearly freezes for a beat after a big bite
+    let simDt = dt;
+    if (this.hitstop > 0) {
+      this.hitstop -= dt;
+      simDt = dt * 0.07;
+    }
+    if (this.running) this._update(simDt);
+    this.background.update(simDt);
+    this.particles.update(simDt);
+    this.sfx.ambientTick(dt);
     this._updateCamera(dt);
     this._draw();
   }
 
   _screenToWorld(sx, sy) {
     return {
-      x: (sx - this.W / 2) / this.cam.zoom + this.cam.x,
-      y: (sy - this.H / 2) / this.cam.zoom + this.cam.y,
+      x: (sx - this.W / 2) / this.zoom + this.cam.x,
+      y: (sy - this.H / 2) / this.zoom + this.cam.y,
     };
   }
 
@@ -245,17 +269,110 @@ export class Game {
     }
     this.powerups = this.powerups.filter((pu) => pu.alive);
 
+    this._updateSwallows(dt);
+    if (!this.running) {
+      this._updateHud();
+      return;
+    }
     this._resolveEating(dt);
     this._resolveHazards(dt);
+    if (!this.running) return;
     this._resolvePowerups();
     this._updateSpawnTimers(dt);
     this._updateHud();
   }
 
   // ------------------------------------------------------------ interactions
-  _eatFish(f, index) {
+  // Eating is a three-beat move: SUCK (prey is dragged into the gaping maw),
+  // CHOMP (jaws slam shut: hit-stop, camera kick, crunch) and GULP (a bulge
+  // rolls down the belly while the gills flare and bubble).
+  _beginSwallow(prey, kind) {
     const p = this.player;
-    this.fishes.splice(index, 1);
+    const rel = clamp(prey.len / p.len, 0.12, 1);
+    const dur = kind === "shark" ? 0.34 : 0.12 + rel * 0.13;
+    prey.swallowK = 0;
+    this.swallows.push({ prey, kind, rel, t: 0, dur, ox: prey.x - p.x, oy: prey.y - p.y });
+    p.suck = 1;
+    p.mouthOpen = Math.max(p.mouthOpen, 0.9);
+    this.sfx.suck(rel, dur);
+    this.particles.suction(p.mouthX, p.mouthY, p.angle, p.len * (0.5 + rel * 0.4), 8 + Math.round(rel * 10));
+  }
+
+  _updateSwallows(dt) {
+    const p = this.player;
+    const a = p.angle;
+    // aim just inside the lips
+    const mx = Math.cos(a) * p.len * 0.34;
+    const my = Math.sin(a) * p.len * 0.34;
+    for (let i = this.swallows.length - 1; i >= 0; i--) {
+      const s = this.swallows[i];
+      s.t = Math.min(1, s.t + dt / s.dur);
+      const k = s.t * s.t; // accelerating pull
+      const f = s.prey;
+      f.x = p.x + lerp(s.ox, mx, k);
+      f.y = p.y + lerp(s.oy, my, k);
+      f.angle = turnToward(f.angle, a + Math.PI, dt * 12); // head-first
+      f.phase += dt * 30; // frantic wriggle
+      f.speed = 0;
+      f.swallowK = s.t;
+      if (f.inflate != null) f.inflate = damp(f.inflate, 0, 10, dt);
+      if (s.t >= 1) {
+        this.swallows.splice(i, 1);
+        this._finishSwallow(s);
+        // A winning bite ends the frame; other meals resume in endless mode.
+        if (!this.running) break;
+      }
+    }
+    p.suck = this.swallows.length > 0 ? 1 : 0;
+  }
+
+  _finishSwallow(s) {
+    const p = this.player;
+    const { prey, kind, rel } = s;
+    const mx = p.mouthX;
+    const my = p.mouthY;
+
+    // CHOMP
+    p.chomp = 1;
+    p.mouthOpen = 0;
+    p.gulpT = 0;
+    p.gulpSize = rel;
+    p.flash = 0.35;
+
+    let colors = ["#dfe9ef", "#ffffff"];
+    let heavy = rel > 0.55;
+    if (kind === "fish") {
+      heavy = heavy || prey.isGold;
+      colors = [prey.spec.body[1][1], prey.spec.body[prey.spec.body.length - 1][1], "#ffffff"];
+      this._eatFish(prey, mx, my);
+    } else if (kind === "puffer") {
+      heavy = true;
+      colors = ["#c9a466", "#efe2c0", "#8b6a3a"];
+      this._eatPuffer(prey, mx, my);
+    } else {
+      heavy = true;
+      colors = ["#66737e", "#e9edf0", "#46525d"];
+      this._eatShark(prey, mx, my);
+    }
+
+    this.hitstop = Math.max(this.hitstop, heavy ? 0.07 + rel * 0.05 : rel > 0.3 ? 0.035 : 0);
+    this.zoomPunch = Math.max(this.zoomPunch, 0.03 + rel * 0.05 + (kind === "shark" ? 0.06 : 0));
+    this.shake = Math.max(this.shake, 2.5 + rel * 6 + (heavy ? 4 : 0));
+    this.particles.ring(mx, my, p.len * (0.1 + rel * 0.12), "rgba(230,250,255,0.9)", 0.3, 2 + rel * 4);
+    this.particles.flakes(mx, my, p.angle, 6 + Math.round(rel * 16), colors, 90 + p.len * 0.9, Math.max(2, prey.len * 0.035));
+    // bubbles vented from the gills
+    const gx = p.x + Math.cos(p.angle) * p.len * 0.2;
+    const gy = p.y + Math.sin(p.angle) * p.len * 0.2;
+    this.particles.bubbles(gx, gy, 4 + Math.round(rel * 8), 70 + p.len * 0.3, 2.5 + p.len * 0.025);
+
+    this.sfx.chomp(rel, this.combo);
+    this.sfx.gulp(rel, 0.07 + rel * 0.05);
+    if (heavy) this.sfx.boom(kind === "fish" ? 0.6 : 1);
+    this.sfx.reward(this.combo);
+  }
+
+  _eatFish(f, x, y) {
+    const p = this.player;
     this.eaten++;
 
     this.combo++;
@@ -278,23 +395,42 @@ export class Game {
     if (f.isGold) {
       growth *= 5;
       points *= 5;
-      this.sfx.bigEat();
-      this.particles.sparkle(f.x, f.y, 18, f.len * 0.5);
+      this.particles.sparkle(x, y, 22, f.len * 0.6);
       this.ui.toast("✨ 吃到黄金鱼！");
-    } else {
-      this.sfx.eat(this.combo);
     }
 
     p.grow(growth);
     this.score += points;
-    p.flash = 0.5;
 
     const color = f.isGold ? "#ffd700" : "#aef2ff";
-    this.particles.burst(f.x, f.y, f.isGold ? "rgba(255,215,60,0.9)" : "rgba(170,230,255,0.85)", 12, 150, f.len * 0.08 + 3);
-    this.particles.bubbles(f.x, f.y, 5, 70, 4);
-    this.particles.text(f.x, f.y - f.len * 0.4, mult > 1 ? `+${points} x${mult}` : `+${points}`, { color, size: clamp(16 + mult * 2, 18, 34) });
+    if (f.isGold) this.particles.burst(x, y, "rgba(255,215,60,0.9)", 14, 150, f.len * 0.08 + 3);
+    this.particles.text(x, y - p.len * 0.3, mult > 1 ? `+${points} x${mult}` : `+${points}`, { color, size: clamp(16 + mult * 2, 18, 34) });
 
     this._spawnFish();
+    this._checkLevelUp();
+  }
+
+  _eatPuffer(f, x, y) {
+    const p = this.player;
+    const points = Math.ceil(f.len / 3) * Math.min(this.combo + 1, 10);
+    this.score += points;
+    this.eaten++;
+    p.grow(f.len * 0.12);
+    this.particles.burst(x, y, "rgba(245,215,140,0.9)", 16, 180, 6);
+    this.particles.text(x, y - p.len * 0.4, `河豚大餐 +${points}`, { color: "#ffe9a8", size: 26 });
+    this._spawnPuffer();
+    this._checkLevelUp();
+  }
+
+  _eatShark(s, x, y) {
+    const p = this.player;
+    const points = 2000;
+    this.score += points;
+    this.eaten++;
+    p.grow(s.len * 0.1);
+    this.particles.burst(x, y, "rgba(180,200,220,0.95)", 30, 260, 9);
+    this.particles.text(x, y - p.len * 0.5, `吞掉鲨鱼！+${points}`, { color: "#ff8a8a", size: 36 });
+    this.ui.toast("🏆 你吃掉了鲨鱼！");
     this._checkLevelUp();
   }
 
@@ -328,7 +464,7 @@ export class Game {
   _resolveEating(dt) {
     const p = this.player;
     if (p.stunned > 0) {
-      p.mouthOpen = damp(p.mouthOpen, 0, 8, dt);
+      p.mouthOpen = damp(p.mouthOpen, p.suck > 0 ? 1.25 : 0, 8, dt);
       return;
     }
 
@@ -342,7 +478,11 @@ export class Game {
       const d = Math.hypot(f.x - p.mouthX, f.y - p.mouthY);
       if (canEat) {
         nearestEdible = Math.min(nearestEdible, d - f.r);
-        if (d < f.r + p.len * 0.1) this._eatFish(f, i);
+        // suction reaches a little ahead of the lips
+        if (d < f.r + p.len * 0.18) {
+          this.fishes.splice(i, 1);
+          this._beginSwallow(f, "fish");
+        }
       }
     }
 
@@ -350,7 +490,7 @@ export class Game {
     for (let i = this.puffers.length - 1; i >= 0; i--) {
       const f = this.puffers[i];
       const d = Math.hypot(f.x - p.mouthX, f.y - p.mouthY);
-      const touching = d < f.r + p.len * 0.12;
+      const touching = d < f.r + p.len * 0.15;
       if (!touching) continue;
       if (f.inflated && p.starPower <= 0) {
         // spiky! bounce off and lose your rhythm
@@ -359,6 +499,7 @@ export class Game {
         p.y += Math.sin(a) * 60;
         p.stunned = Math.max(p.stunned, 0.7);
         p.shrink(0.97);
+        this._checkLevelUpDown();
         this.combo = 0;
         this.comboTimer = 0;
         if (this.frenzy) {
@@ -372,15 +513,7 @@ export class Game {
         this.particles.text(p.x, p.y - p.len * 0.5, "被刺到了！", { color: "#ffb45e", size: 22 });
       } else if (p.len > f.len * EAT_RATIO) {
         this.puffers.splice(i, 1);
-        const points = Math.ceil(f.len / 3) * Math.min(this.combo + 1, 10);
-        this.score += points;
-        this.eaten++;
-        p.grow(f.len * 0.12);
-        this.sfx.bigEat();
-        this.particles.burst(f.x, f.y, "rgba(245,215,140,0.9)", 18, 180, 6);
-        this.particles.text(f.x, f.y - f.r, `河豚大餐 +${points}`, { color: "#ffe9a8", size: 26 });
-        this._spawnPuffer();
-        this._checkLevelUp();
+        this._beginSwallow(f, "puffer");
       }
     }
 
@@ -388,23 +521,19 @@ export class Game {
     if (this.shark) {
       const s = this.shark;
       const d = Math.hypot(s.x - p.mouthX, s.y - p.mouthY);
-      if (p.len > s.len * EAT_RATIO && d < s.r + p.len * 0.12) {
+      if (p.len > s.len * EAT_RATIO && d < s.r + p.len * 0.15) {
         this.shark = null;
-        const points = 2000;
-        this.score += points;
-        this.eaten++;
-        p.grow(s.len * 0.1);
-        this.sfx.bigEat();
-        this.shake = 10;
-        this.particles.burst(s.x, s.y, "rgba(180,200,220,0.95)", 30, 260, 9);
-        this.particles.text(s.x, s.y - s.r, `吞掉鲨鱼！+${points}`, { color: "#ff8a8a", size: 36 });
-        this.ui.toast("🏆 你吃掉了鲨鱼！");
-        this._checkLevelUp();
+        this._beginSwallow(s, "shark");
       }
     }
 
-    const openTarget = nearestEdible < p.len * 1.1 ? 1 : 0;
-    p.mouthOpen = damp(p.mouthOpen, openTarget, 8, dt);
+    // jaws gape wider the closer the meal; forced wide open while sucking
+    if (p.suck > 0) {
+      p.mouthOpen = damp(p.mouthOpen, 1.25, 22, dt);
+    } else {
+      const openTarget = nearestEdible < p.len * 1.1 ? clamp(1.25 - nearestEdible / (p.len * 1.4), 0.45, 1) : 0;
+      p.mouthOpen = damp(p.mouthOpen, openTarget, 9, dt);
+    }
   }
 
   _resolveHazards(dt) {
@@ -420,6 +549,7 @@ export class Game {
         p.stunned = Math.max(p.stunned, 1.1);
         p.invincible = Math.max(p.invincible, 1.6);
         p.shrink(0.96);
+        this._checkLevelUpDown();
         this.combo = 0;
         this.comboTimer = 0;
         if (this.frenzy) {
@@ -581,55 +711,71 @@ export class Game {
     this.cam.y = clamp(this.cam.y, Math.min(hh, WORLD_H / 2), Math.max(WORLD_H - hh, WORLD_H / 2));
 
     this.shake = Math.max(0, this.shake - dt * 26);
+    this.zoomPunch = damp(this.zoomPunch, 0, 9, dt);
     this.hurtFlash = Math.max(0, this.hurtFlash - dt * 1.8);
   }
 
   _applyCamera(ctx, parallax = 1) {
-    const { zoom } = this.cam;
-    const shakeX = this.shake > 0 ? randRange(-this.shake, this.shake) : 0;
-    const shakeY = this.shake > 0 ? randRange(-this.shake, this.shake) : 0;
+    const zoom = this.zoom;
+    const shakeX = this.shake > 0 ? this._shakeX : 0;
+    const shakeY = this.shake > 0 ? this._shakeY : 0;
     // anchor far layers so they stay inside the world while moving slower
     const cx = this.cam.x * parallax + (WORLD_W / 2) * (1 - parallax);
     const cy = this.cam.y * parallax + WORLD_H * (1 - parallax) * 0.9;
     ctx.setTransform(
       this.dpr * zoom, 0, 0, this.dpr * zoom,
-      this.dpr * (this.W / 2 - cx * zoom + shakeX),
-      this.dpr * (this.H / 2 - cy * zoom + shakeY)
+      this.dpr * (this.W / 2 - cx * zoom + shakeX * parallax),
+      this.dpr * (this.H / 2 - cy * zoom + shakeY * parallax)
     );
   }
 
   // ------------------------------------------------------------------ draw
   _draw() {
     const ctx = this.ctx;
+    const bg = this.background;
+    const zoom = this.zoom;
+    this._shakeX = randRange(-this.shake, this.shake);
+    this._shakeY = randRange(-this.shake, this.shake);
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
 
-    // 1. water + rays + snow (screen space)
-    this.background.drawWater(ctx, this.W, this.H, this.cam);
-    this.background.drawRays(ctx, this.W, this.H, this.cam, this.time);
+    // 1. water column (screen space)
+    bg.drawWater(ctx, this.W, this.H, this.cam);
 
-    // 2. far parallax silhouettes
-    this._applyCamera(ctx, 0.45);
-    this.background.drawFar(ctx, this.time);
+    // 2. parallax: hazy far reef + schools, then darker mid pinnacles
+    this._applyCamera(ctx, 0.35);
+    bg.drawFar(ctx, this.time);
+    this._applyCamera(ctx, 0.65);
+    bg.drawMid(ctx, this.time);
 
     // 3. world layer
     this._applyCamera(ctx, 1);
+    const worldM = ctx.getTransform();
     const view = {
-      left: this.cam.x - this.W / (2 * this.cam.zoom) - 60,
-      right: this.cam.x + this.W / (2 * this.cam.zoom) + 60,
-      top: this.cam.y - this.H / (2 * this.cam.zoom) - 60,
-      bottom: this.cam.y + this.H / (2 * this.cam.zoom) + 60,
+      left: this.cam.x - this.W / (2 * zoom) - 60,
+      right: this.cam.x + this.W / (2 * zoom) + 60,
+      top: this.cam.y - this.H / (2 * zoom) - 60,
+      bottom: this.cam.y + this.H / (2 * zoom) + 60,
     };
-    this.background.drawWorld(ctx, this.time, view);
+    bg.drawWorld(ctx, this.time, view);
 
     if (this.player) {
+      // caustic light rippling over fish backs, strongest near the surface
+      const depth = clamp(this.cam.y / WORLD_H, 0, 1);
+      setFishLighting(bg.patterns(ctx).caustic2, worldM, bg.causticMatrix(this.time, 1), 0.28 * (1 - depth) + 0.04);
+
+      const inView = (f) => !(f.x + f.len < view.left || f.x - f.len > view.right || f.y + f.len < view.top || f.y - f.len > view.bottom);
+      const sorted = [...this.fishes].sort((a, b) => a.len - b.len);
+
+      // contact shadows on the sand
+      for (const f of sorted) if (inView(f)) bg.drawShadow(ctx, f.x, f.y, f.len);
+      for (const f of this.puffers) bg.drawShadow(ctx, f.x, f.y, f.len);
+      if (this.shark) bg.drawShadow(ctx, this.shark.x, this.shark.y, this.shark.len);
+      bg.drawShadow(ctx, this.player.x, this.player.y, this.player.len);
+
       for (const pu of this.powerups) pu.draw(ctx);
 
       // small fish first so bigger ones overlap them
-      const sorted = [...this.fishes].sort((a, b) => a.len - b.len);
-      for (const f of sorted) {
-        if (f.x + f.len < view.left || f.x - f.len > view.right || f.y + f.len < view.top || f.y - f.len > view.bottom) continue;
-        f.draw(ctx);
-      }
+      for (const f of sorted) if (inView(f)) f.draw(ctx);
       for (const f of this.puffers) f.draw(ctx);
       if (this.shark) this.shark.draw(ctx);
 
@@ -645,14 +791,34 @@ export class Game {
         ctx.restore();
       }
 
-      this.player.draw(ctx, this.time);
+      // prey being swallowed is painted inside the open maw (over the throat, under the jaws)
+      const inMouth = this.swallows.length
+        ? (c) => {
+            c.save();
+            c.setTransform(worldM);
+            c.globalAlpha = 1;
+            for (const s of this.swallows) s.prey.draw(c);
+            c.restore();
+          }
+        : null;
+      this.player.draw(ctx, this.time, inMouth);
       for (const j of this.jellies) j.draw(ctx);
       this.particles.draw(ctx);
-      this.particles.drawTexts(ctx, this.cam.zoom);
     }
 
-    // 4. screen-space overlays
+    // 4. screen-space water volume: god rays, marine snow, light falloff
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    bg.drawRays(ctx, this.W, this.H, this.cam, this.time);
+    bg.drawSnow(ctx, this.W, this.H, this.cam);
+    bg.drawLight(ctx, this.W, this.H, this.cam);
+
+    if (this.player) {
+      this._applyCamera(ctx, 1);
+      this.particles.drawTexts(ctx, zoom);
+      ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    }
+
+    // 5. overlays
     this._drawVignette(ctx);
     if (this.frenzy) {
       const a = 0.12 + Math.sin(this.time * 7) * 0.05;
